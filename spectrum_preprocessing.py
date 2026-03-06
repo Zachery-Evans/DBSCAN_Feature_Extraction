@@ -6,6 +6,8 @@ Date Created: 2023-04-01
 
 """
 #imports
+import os 
+import re
 import pandas as pd 
 import numpy as np 
 import numpy.matlib 
@@ -16,9 +18,10 @@ from scipy.sparse.linalg import spsolve
 from scipy.linalg import cholesky
 from scipy import sparse
 from scipy.stats import norm
-from scipy.integrate import simpson as simps
+from scipy.integrate import simpson
 from scipy.spatial import ConvexHull
 from scipy.signal import find_peaks
+from scipy.stats import gaussian_kde
 
 def airpls(x, lam=100, porder=1, itermax=100):
     '''
@@ -110,6 +113,165 @@ def WhittakerSmooth(x, w, lam, differences=1):
     background = spsolve(A, B)
     return np.array(background)
 
+def interpolate_spectrum(input_wavenumber, input_absorbance, low=898, high=3800):
+    '''
+    Arguments:
+        input_wavenumber {array} -- a numpy array of shape [x,]
+        input_absorbance {array} -- a numpy array of shape [x,]
+        low {int} -- low wavenumber cutoff for interpolation window
+        high {int} -- high wavenumumber cutoff for interpolation window   
+        
+    Returns:
+        interpolated_wavenumber {array} -- interpolated wavenumber array as defined by low and high
+        interpolated_absorbance {array} -- interpolated absorbance array
+        
+    '''
+
+    tck = interpolate.make_splrep(input_wavenumber, input_absorbance, s=0)
+    window = high - low + 1
+    interpolated_wavenumber = np.linspace(low, high, window)
+    interpolated_absorbance = interpolate.splev(interpolated_wavenumber, tck, der=0)
+    
+    return (interpolated_wavenumber, interpolated_absorbance)
+
+def vector_normalization(spectrum):
+    '''
+    Arguments:
+        spectrum {array} -- baseline corrected spectrum
+    
+    Outputs:
+        spec_norm {array} -- vector normalized spectrum
+    '''
+    
+    L2_norm = (sum(spectrum**2))**0.5
+    
+    spec_norm = spectrum / L2_norm
+    
+    return spec_norm
+
+def minmax_normalization(spectrum):
+    '''
+    Min-Max 0 to 1 normalization on a per-spectrum basis.
+
+    Arguments:
+        spectrum {array} -- a numpy array of shape [x,]
+
+    Returns:
+        mix_max_norm {array} -- a numpy array of shape [x,], 0 to 1 normalized
+    '''
+    min_max_norm = (spectrum - spectrum.min()) / ( spectrum.max() -  spectrum.min()) 
+
+    return min_max_norm
+
+def integrate_peak(wavenumbers, absorbance, low=2000, high=2050):
+    """
+    Integrate the area of a peak in the absorbance array between the specified low
+    and high wavenumber values using Simpson's rule.
+    """
+    # Find the indices of the low and high wavenumber values
+    low_idx = (wavenumbers >= low).argmax()
+    high_idx = (wavenumbers <= high).argmin()
+
+    # Use Simpson's rule to integrate the peak
+    integrated_area = simpson(absorbance[low_idx:high_idx+1], x=wavenumbers[low_idx:high_idx+1])
+
+    return integrated_area
+
+def cut_keep(wavenumbers, absorbances, lowerBound=898, upperBound=3998):
+    """
+    Arguments: 
+        wavenumbers {array}: -- a numpy array
+        absorbances {array}: -- a numpy array
+        lowerBound {int}: -- integer
+        upperBound {int}: -- integer
+    
+    Returns: 
+        cut_wavenumber {array}: -- a numpy array
+        cut_absorbance {array}: -- a numpy array
+
+    Selects a range of wavenumbers from a lower bound to an upper bound
+    and return two arrays, one containing the selected wavenumbers and
+    the other containing the absorbance values corresponding to those 
+    wavenumbers. 
+    
+    :param wavenumbers: Array containing all of the wavenumbers
+    :param absorbance: Array containing all of the absorbance values
+    :param lowerBound: lower bound or smallest wavenumber
+    :param upperBound: upper bound or largest wavenumber
+    """
+
+    lowerIdx = (np.abs(wavenumbers - lowerBound)).argmin()
+    upperIdx = (np.abs(wavenumbers - upperBound)).argmin()
+
+    cut_absorbances = absorbances[lowerIdx:upperIdx]
+    cut_wavenumbers = wavenumbers[lowerIdx:upperIdx]
+
+    return cut_wavenumbers, cut_absorbances
+
+def rubberband_baseline(wavenumbers, absorbance):
+    """
+    Calculate rubberband baseline.
+    
+    Arguments:
+        wavenumber {array} -- a numpy array 
+        absorbance {array} -- a numpy array
+
+    Returns:
+        baseline {array} -- a numpy array
+    """
+    x = np.asarray(wavenumbers, dtype=np.float64)
+    y = np.asarray(absorbance, dtype=np.float64)
+    points = list((zip(x, y)))
+    # Find the convex hull
+    v = ConvexHull(points).vertices
+    # Rotate convex hull vertices until they start from the lowest one
+    v = np.roll(v, -v.argmin())
+    # Leave only the ascending part
+    v = v[:v.argmax()]
+
+    # Create baseline using linear interpolation between vertices
+    baseline = np.interp(x, x[v], y[v]).astype('float')
+    
+    return baseline
+
+def calculate_peak_intensity(wavenumbers, intensities, wavenumber_range):
+    """
+    Calculate peak intenisty with respect to linear baseline in wavenumber range.
+    
+    Arguments:
+        wavenumbers {array} -- a numpy array 
+        intensities {array} -- a numpy array
+        wavenumber_range {tuple} -- (low, high)
+
+    Returns:
+        peak_wavenumber, peak_relative_intensity {tuple} -- (peak position, peak intensity)
+    """
+    
+    wavenumbers = np.asarray(wavenumbers, dtype=np.float64)
+    intensities = np.asarray(intensities, dtype=np.float64)
+    # Find indices corresponding to the wavenumber range
+    range_indices = np.where((wavenumbers >= wavenumber_range[0]) & (wavenumbers <= wavenumber_range[1]))
+
+    # Extract the wavenumbers and intensities within the range
+    range_wavenumbers = wavenumbers[range_indices]
+    range_intensities = intensities[range_indices]
+
+    # Find the index of the peak maximum within the range
+    peak_index = np.argmax(range_intensities)
+    peak_wavenumber = range_wavenumbers[peak_index]
+    peak_intensity = range_intensities[peak_index]
+
+    # Fit a linear baseline to the low and high ends of the wavenumber range
+    baseline_indices = np.where((wavenumbers < wavenumber_range[0]) | (wavenumbers > wavenumber_range[1]))
+    baseline_wavenumbers = wavenumbers[baseline_indices]
+    baseline_intensities = intensities[baseline_indices]
+    baseline_slope, baseline_intercept = np.polyfit(baseline_wavenumbers, baseline_intensities, 1)
+
+    # Calculate the intensity of the peak relative to the linear baseline
+    peak_intensity_relative = peak_intensity - (baseline_slope * peak_wavenumber + baseline_intercept)
+
+    return peak_wavenumber, peak_intensity_relative
+
 
 def polynomial_background(wavenumber, absorbance, odr=10, s=0.006, fct='atq'):
     '''
@@ -183,130 +345,130 @@ def polynomial_background(wavenumber, absorbance, odr=10, s=0.006, fct='atq'):
     
     return z, a, it, odr, s, fct
 
+def roundWavenumbers(dataframe):
+    """
+    Function for rounding the wavenumbers so that there is no mismatch between the machine 
+    precision of saving the files in Quasar and the wavenumbers output by the FTIR microscope
+    """
+    last_nonwavenum_idx = dataframe.columns.get_loc('1981.7 - 2095.8') + 1
 
-def interpolate_spectrum(input_wavenumber, input_absorbance, low=898, high=3800):
-    '''
+    dataframe = dataframe.rename(columns=lambda c: round(float(c), 1) if c not in dataframe.columns[:last_nonwavenum_idx] else c)
+    return dataframe
+
+def distribution_Selection(df, distributionIdx, numberOfSigmas):
+    """
+    Screens data based on the distribution of a given column in a pandas dataframe. 
+    Built for screening out dataset values that do not have a sufficient 2019 wavenumber 
+    integral for the PEX project. Can be modified to projects liking. 
+
+    Returns the selected datas indexes, the discarded indexes, the mask used to select the data,
+    the x position of the distribution mode, and the column values of the distribution that is
+    being used to screen data. In this case the values of the baseline integral of the PE 2019
+    wavenumber peak. 
+    """
+    
+    df[distributionIdx] = df[distributionIdx].astype(float)
+
+    #creating variable for the array of Polyethylene Area
+    area = df[distributionIdx].values
+
+    # Use Gaussian KDE to find the center position of the rightmost mode by creating x coords
+    # and then using np.argmax to determine the point with the highest number of counts
+    kde = gaussian_kde(area)
+    xs = np.linspace(area.min(), area.max(), 1000)
+    modePosition = xs[np.argmax(kde(xs))]
+
+    # Use only the values greater than 1.5 to determine the std of the PE peaks
+    positive_vals = area[area > 1.5]
+    sigma = positive_vals.std()
+
+    lowerDistributionBound = modePosition - numberOfSigmas * sigma
+    upperDistributionBound = modePosition + numberOfSigmas * sigma
+
+    # Select the range of PE normalization integral to be accepted by the mask
+    mask_selected = (~np.isnan(area) & (area >= lowerDistributionBound) & (area <= upperDistributionBound))
+    
+    selected_indexes = df.index[mask_selected]
+    discarded_indexes = df.index[~mask_selected]
+
+    return selected_indexes, discarded_indexes, mask_selected, modePosition, area
+
+def thickness_normalizer(spectrum_array, IntStd):
+    """"
+    Normalize the spectrum to correct for differences in slice thickness.
+    
     Arguments:
-        input_wavenumber {array} -- a numpy array of shape [x,]
-        input_absorbance {array} -- a numpy array of shape [x,]
-        low {int} -- low wavenumber cutoff for interpolation window
-        high {int} -- high wavenumumber cutoff for interpolation window   
+        spectrum_array {array} -- An array corresponding to the absorbance values of an IR spectrum.
+        IntStd {float} -- The integrated area (2050-2000 cm-1) of the PE internal standard absorbance band.
         
     Returns:
-        interpolated_wavenumber {array} -- interpolated wavenumber array as defined by low and high
-        interpolated_absorbance {array} -- interpolated absorbance array
-        
-    '''
-    tck = interpolate.make_splrep(input_wavenumber, input_absorbance,  s=0)
-    window = high - low + 1
-    interpolated_wavenumber = np.linspace(low, high, window)
-    interpolated_absorbance = interpolate.splev(interpolated_wavenumber, tck, der=0)
+        normalized_spectrum_array {array} -- The IR absorbance spectrum corrected for thickness
     
-    return (interpolated_wavenumber, interpolated_absorbance)
-
-def vector_normalization(spectrum):
-    '''
-    Arguments:
-        spectrum {array} -- baseline corrected spectrum
-    
-    Outputs:
-        spec_norm {array} -- vector normalized spectrum
-    '''
-    
-    L2_norm = (sum(spectrum**2))**0.5
-    
-    spec_norm = spectrum / L2_norm
-    
-    return spec_norm
-
-def minmax_normalization(spectrum):
-    '''
-    Min-Max 0 to 1 normalization on a per-spectrum basis.
-
-    Arguments:
-        spectrum {array} -- a numpy array of shape [x,]
-
-    Returns:
-        mix_max_norm {array} -- a numpy array of shape [x,], 0 to 1 normalized
-    '''
-    min_max_norm = (spectrum - spectrum.min()) / ( spectrum.max() -  spectrum.min()) 
-
-    return min_max_norm
-
-def integrate_peak(wavenumbers, absorbance, low=2000, high=2050):
     """
-    Integrate the area of a peak in the absorbance array between the specified low
-    and high wavenumber values using Simpson's rule.
-    """
-    # Find the indices of the low and high wavenumber values
-    low_idx = (wavenumbers >= low).argmax()
-    high_idx = (wavenumbers <= high).argmin()
-
-    # Use Simpson's rule to integrate the peak
-    integrated_area = simps(absorbance[low_idx:high_idx+1], x=wavenumbers[low_idx:high_idx+1])
-
-    return integrated_area
-
-def rubberband_baseline(wavenumbers, absorbance):
-    """
-    Calculate rubberband baseline.
+    thickness_normalizer = (IntStd/34)
+    normalized_spectrum_array = np.array(spectrum_array)/thickness_normalizer
     
-    Arguments:
-        wavenumber {array} -- a numpy array 
-        absorbance {array} -- a numpy array
+    return normalized_spectrum_array
 
-    Returns:
-        baseline {array} -- a numpy array
-    """
-    x = np.asarray(wavenumbers, dtype=np.float64)
-    y = np.asarray(absorbance, dtype=np.float64)
-    points = list((zip(x, y)))
-    # Find the convex hull
-    v = ConvexHull(points).vertices
-    # Rotate convex hull vertices until they start from the lowest one
-    v = np.roll(v, -v.argmin())
-    # Leave only the ascending part
-    v = v[:v.argmax()]
+def pipeline(expt_wavenumber, expt_absorbance):
+    f = expt_wavenumber
+    a = expt_absorbance
 
-    # Create baseline using linear interpolation between vertices
-    baseline = np.interp(x, x[v], y[v]).astype('float')
+    #apply the interpolation to the spectral window
+    interpolated_wavenumber, interpolated_absorbance = interpolate_spectrum(f, a, 898, 1400)
+
+    #calculate the baseline
+    baseline1 = airpls(interpolated_absorbance)
+    #baseline correct the spectrum
+    corrected1 = interpolated_absorbance - baseline1
+
+    baseline2 = polynomial_background(interpolated_wavenumber, corrected1,odr=2, s=0.006, fct='atq')[0]
+    corrected2 = corrected1 - baseline2
+
+    baseline3 = rubberband_baseline(interpolated_wavenumber, corrected2)
+    corrected3 = corrected2 - baseline3
+
+    fingerprint_cm = interpolated_wavenumber
+    fingerprint_abs = corrected3
     
-    return baseline
+    #apply the interpolation to the spectral window
+    interpolated_wavenumber, interpolated_absorbance = interpolate_spectrum(f, a, 1520, 1800)
+    #calculate the baseline
+    baseline1 = airpls(interpolated_absorbance)
 
-def calculate_peak_intensity(wavenumbers, intensities, wavenumber_range):
-    """
-    Calculate peak intenisty with respect to linear baseline in wavenumber range.
+    #baseline correct the spectrum
+    corrected1 = interpolated_absorbance - baseline1
+
+    baseline2 = rubberband_baseline(interpolated_wavenumber, corrected1)
+    corrected2 = corrected1 - baseline2
+
+    carbonyl_cm = interpolated_wavenumber
+    carbonyl_abs = corrected2
     
-    Arguments:
-        wavenumbers {array} -- a numpy array 
-        intensities {array} -- a numpy array
-        wavenumber_range {tuple} -- (low, high)
+    #apply the interpolation to the spectral window
+    interpolated_wavenumber, interpolated_absorbance = interpolate_spectrum(f, a, 1850, 2110)
+    #calculate the baseline
+    baseline1 = airpls(interpolated_absorbance)
+    #baseline correct the spectrum
+    corrected1 = interpolated_absorbance - baseline1
 
-    Returns:
-        peak_wavenumber, peak_relative_intensity {tuple} -- (peak position, peak intensity)
-    """
+    baseline2 = rubberband_baseline(interpolated_wavenumber, corrected1)
+    corrected2 = corrected1 - baseline2
+
+    polyethylene_cm = interpolated_wavenumber
+    polyethylene_abs = corrected2
     
-    wavenumbers = np.asarray(wavenumbers, dtype=np.float64)
-    intensities = np.asarray(intensities, dtype=np.float64)
-    # Find indices corresponding to the wavenumber range
-    range_indices = np.where((wavenumbers >= wavenumber_range[0]) & (wavenumbers <= wavenumber_range[1]))
+    def merge_arrays(arr1, arr2, arr3):
+        merged_array = np.concatenate((arr1, arr2, arr3))
+        return merged_array
+    
+    wavenumber = merge_arrays(fingerprint_cm, carbonyl_cm, polyethylene_cm)
+    absorbance = merge_arrays(fingerprint_abs, carbonyl_abs, polyethylene_abs)
 
-    # Extract the wavenumbers and intensities within the range
-    range_wavenumbers = wavenumbers[range_indices]
-    range_intensities = intensities[range_indices]
-
-    # Find the index of the peak maximum within the range
-    peak_index = np.argmax(range_intensities)
-    peak_wavenumber = range_wavenumbers[peak_index]
-    peak_intensity = range_intensities[peak_index]
-
-    # Fit a linear baseline to the low and high ends of the wavenumber range
-    baseline_indices = np.where((wavenumbers < wavenumber_range[0]) | (wavenumbers > wavenumber_range[1]))
-    baseline_wavenumbers = wavenumbers[baseline_indices]
-    baseline_intensities = intensities[baseline_indices]
-    baseline_slope, baseline_intercept = np.polyfit(baseline_wavenumbers, baseline_intensities, 1)
-
-    # Calculate the intensity of the peak relative to the linear baseline
-    peak_intensity_relative = peak_intensity - (baseline_slope * peak_wavenumber + baseline_intercept)
-
-    return peak_wavenumber, peak_intensity_relative
+    internal_std_int = calculate_peak_intensity(wavenumber, absorbance, (1990,2090))[1]
+    absorbance = absorbance/internal_std_int
+    Std = integrate_peak(wavenumber, absorbance, low=2000, high=2050)
+    Abs = absorbance[0:len(wavenumber)]
+    absorbance = thickness_normalizer(Abs, Std)
+    
+    return wavenumber, absorbance
