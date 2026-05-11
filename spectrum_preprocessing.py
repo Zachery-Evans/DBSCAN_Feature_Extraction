@@ -23,6 +23,7 @@ from scipy.spatial import ConvexHull
 from scipy.signal import find_peaks
 from scipy.stats import gaussian_kde
 
+
 def airpls(x, lam=100, porder=1, itermax=100):
     '''
     airpls.py Copyright 2014 Renato Lombardo - renato.lombardo@unipa.it
@@ -126,12 +127,27 @@ def interpolate_spectrum(input_wavenumber, input_absorbance, low=898, high=3800)
         interpolated_absorbance {array} -- interpolated absorbance array
         
     '''
+    try:
+        tck = interpolate.make_splrep(input_wavenumber, input_absorbance, s=0)
+        window = high - low + 1
+        interpolated_wavenumber = np.linspace(low, high, window)
+        interpolated_absorbance = interpolate.splev(interpolated_wavenumber, tck, der=0)
+    #Value error in case there are infs or nans in the dataset
+    except ValueError:
+        invalid = ~np.isfinite(input_absorbance)
+        valid = ~invalid
+        
+        # Indices of all elements
+        indices = np.arange(len(input_absorbance))
+        
+        # Fill invalid spots with interpolated values
+        input_absorbance[invalid] = np.interp(indices[invalid], indices[valid], input_absorbance[valid])
 
-    tck = interpolate.make_splrep(input_wavenumber, input_absorbance, s=0)
-    window = high - low + 1
-    interpolated_wavenumber = np.linspace(low, high, window)
-    interpolated_absorbance = interpolate.splev(interpolated_wavenumber, tck, der=0)
-    
+        tck = interpolate.make_splrep(input_wavenumber, input_absorbance, s=0)
+        window = high - low + 1
+        interpolated_wavenumber = np.linspace(low, high, window)
+        interpolated_absorbance = interpolate.splev(interpolated_wavenumber, tck, der=0)
+        
     return (interpolated_wavenumber, interpolated_absorbance)
 
 def vector_normalization(spectrum):
@@ -350,9 +366,10 @@ def roundWavenumbers(dataframe):
     Function for rounding the wavenumbers so that there is no mismatch between the machine 
     precision of saving the files in Quasar and the wavenumbers output by the FTIR microscope
     """
-    last_nonwavenum_idx = dataframe.columns.get_loc('1981.7 - 2095.8') + 1
+    numlike = re.compile(r"^-?\d+(\.\d+)?$")
+    numeric_idxs = np.array([c for c in dataframe.columns if numlike.match(str(c).strip())])
 
-    dataframe = dataframe.rename(columns=lambda c: round(float(c), 1) if c not in dataframe.columns[:last_nonwavenum_idx] else c)
+    dataframe = dataframe.rename(columns=lambda c: round(float(c), 1) if c in numeric_idxs else c)
     return dataframe
 
 def distribution_Selection(df, distributionIdx, numberOfSigmas):
@@ -410,53 +427,34 @@ def thickness_normalizer(spectrum_array, IntStd):
     
     return normalized_spectrum_array
 
+def process_region(f, a, low, high, use_poly=False):
+    """Process a single spectral region."""
+    interpolated_wavenumber, interpolated_absorbance = interpolate_spectrum(f, a, low, high)
+    baseline1 = airpls(interpolated_absorbance)
+    corrected1 = interpolated_absorbance - baseline1
+    
+    if use_poly:
+        baseline2 = polynomial_background(interpolated_wavenumber, corrected1, odr=2, s=0.006, fct='atq')[0]
+    else:
+        baseline2 = rubberband_baseline(interpolated_wavenumber, corrected1)
+    corrected2 = corrected1 - baseline2
+    
+    if use_poly:
+        baseline3 = rubberband_baseline(interpolated_wavenumber, corrected2)
+        corrected3 = corrected2 - baseline3
+        return interpolated_wavenumber, corrected3
+    else:
+        return interpolated_wavenumber, corrected2
+
 def pipeline(expt_wavenumber, expt_absorbance):
     f = expt_wavenumber
     a = expt_absorbance
 
-    #apply the interpolation to the spectral window
-    interpolated_wavenumber, interpolated_absorbance = interpolate_spectrum(f, a, 898, 1400)
-
-    #calculate the baseline
-    baseline1 = airpls(interpolated_absorbance)
-    #baseline correct the spectrum
-    corrected1 = interpolated_absorbance - baseline1
-
-    baseline2 = polynomial_background(interpolated_wavenumber, corrected1,odr=2, s=0.006, fct='atq')[0]
-    corrected2 = corrected1 - baseline2
-
-    baseline3 = rubberband_baseline(interpolated_wavenumber, corrected2)
-    corrected3 = corrected2 - baseline3
-
-    fingerprint_cm = interpolated_wavenumber
-    fingerprint_abs = corrected3
+    fingerprint_cm, fingerprint_abs =  process_region(f, a, 895, 1205, use_poly = True)
     
-    #apply the interpolation to the spectral window
-    interpolated_wavenumber, interpolated_absorbance = interpolate_spectrum(f, a, 1520, 1800)
-    #calculate the baseline
-    baseline1 = airpls(interpolated_absorbance)
+    carbonyl_cm, carbonyl_abs = process_region(f, a, 1520, 1800, use_poly = True)
 
-    #baseline correct the spectrum
-    corrected1 = interpolated_absorbance - baseline1
-
-    baseline2 = rubberband_baseline(interpolated_wavenumber, corrected1)
-    corrected2 = corrected1 - baseline2
-
-    carbonyl_cm = interpolated_wavenumber
-    carbonyl_abs = corrected2
-    
-    #apply the interpolation to the spectral window
-    interpolated_wavenumber, interpolated_absorbance = interpolate_spectrum(f, a, 1850, 2110)
-    #calculate the baseline
-    baseline1 = airpls(interpolated_absorbance)
-    #baseline correct the spectrum
-    corrected1 = interpolated_absorbance - baseline1
-
-    baseline2 = rubberband_baseline(interpolated_wavenumber, corrected1)
-    corrected2 = corrected1 - baseline2
-
-    polyethylene_cm = interpolated_wavenumber
-    polyethylene_abs = corrected2
+    polyethylene_cm, polyethylene_abs = process_region(f, a, 1850, 2110, use_poly = False)
     
     def merge_arrays(arr1, arr2, arr3):
         merged_array = np.concatenate((arr1, arr2, arr3))
@@ -468,7 +466,11 @@ def pipeline(expt_wavenumber, expt_absorbance):
     internal_std_int = calculate_peak_intensity(wavenumber, absorbance, (1990,2090))[1]
     absorbance = absorbance/internal_std_int
     Std = integrate_peak(wavenumber, absorbance, low=2000, high=2050)
-    Abs = absorbance[0:len(wavenumber)]
+
+
+    cutoff = len(wavenumber) - len(polyethylene_cm)
+    Abs = absorbance[:cutoff]
     absorbance = thickness_normalizer(Abs, Std)
+    wavenumber = wavenumber[:cutoff]
     
     return wavenumber, absorbance
